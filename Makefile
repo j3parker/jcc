@@ -1,0 +1,2 @@
+all:
+	jison c.jison
