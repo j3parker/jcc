@@ -1416,5 +1416,12 @@ declaration_list
 
 start
     : translation_unit EOF { return $$ = $1; }
+    | expression EOF
+      {
+        $$ = new Object();
+        $$.node_type = "expression_shortcut";
+        $$.expr = $1;
+        return $$;
+      }
     ;
 

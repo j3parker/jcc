@@ -1,24 +1,32 @@
+// Global because the parser uses it - urg TODO
+function copy_type(x) {
+  assert(x.node_type === "type");
+  var res = new Object();
+  res.node_type = "type";
+  res.base_type = x.base_type;
+  res.storage = x.storage;
+  res.qualifiers = x.qualifiers;
+  res.lvalue = x.lvalue;
+  res.return_type = x.return_type;
+  res.params = x.params;
+  return res;
+}
+
+// This is lame and should be removed/changed
+function assert(cond, msg) {
+  if(!cond) {
+    throw { message: "Assertion from function " + arguments.callee.caller.name + ": " + msg  };
+  }
+}
+
 function JCC() {
 
   /*******************************/
   /* TYPE/SYMBOL TABLE UTILITIES */
   /*******************************/
 
-  function copy_type(x) {
-    assert(x.node_type === "type");
-    var res = new Object();
-    res.node_type = "type";
-    res.base_type = x.base_type;
-    res.storage = x.storage;
-    res.qualifiers = x.qualifiers;
-    res.lvalue = x.lvalue;
-    res.return_type = x.return_type;
-    res.params = x.params;
-    return res;
-  }
-
   // Determines if two types are implicitly coercible
-  function unifiable(x,y) {
+  function unifiable(x, y) {
     return x.base_type[0] === y.base_type[0]; // TODO
   }
 
@@ -36,7 +44,7 @@ function JCC() {
     };
   }
 
-  function alloc_size(x) { return 4; }
+  function alloc_size(x) { return 1; }
 
   function add_symbol(syms, def) {
     assert(typeof syms !== "undefined", "parent scope undefined");
@@ -59,17 +67,6 @@ function JCC() {
     }
   }
 
-  /********/
-  /* MISC */
-  /********/
-
-  // This is lame and should be removed/changed
-  function assert(cond, msg) {
-    if(!cond) {
-      throw { message: "Assertion from function " + arguments.callee.caller.name + ": " + msg  };
-    }
-  }
-
   /*********************/
   /* SEMANTIC ANALYSIS */
   /*********************/
@@ -83,7 +80,7 @@ function JCC() {
     switch(node.node_type) {
       case "root":
         node.symbols = new Object();
-        node.parent = null;
+        node.parent = (acc == null ? null : acc.parent_scope);
         acc = { parent_scope: node, iteration_type: "" };
         for(i = 0; i < node.globals.length; i++) {
           if(node.globals[i].node_type === "declaration") {
@@ -398,8 +395,10 @@ function JCC() {
             node.symbols[sym].loc = acc.fp_offset + len;
           }
         }
-        if(len != 0) {
-          asm.push(mips_allocai(len));
+        if(len + acc.alloci_debt != 0) {
+          asm.push(mips_allocai(len + acc.alloci_debt));
+          acc.fp_offset += acc.alloci_debt;
+          acc.alloci_debt = 0;
         }
         acc.fp_offset += len;
         var oldscope = acc.scope;
@@ -424,17 +423,22 @@ function JCC() {
         acc.regs.invalidate(src1);
         break;
       case 'function_definition':
-        asm.push(node.name + ':');
+        asm.push('_' + node.name + ':');
         acc.fp_offset = 0;
         var len = 0;
         for(i = node.type.params.length - 1; i >= 4; i--) {
           len += alloc_size(node.type.params[i].type);
           node.symbols[':'+ node.type.params[i].name].loc = -len - 25*4;
         }
+        acc.alloci_debt = 0;
         for(i = 0; i < Math.min(4, node.type.params.length); i++) {
-          var dst = acc.regs.get_reg(find_symbol(node, node.type.params[i].name));
+          var sym = find_symbol(node, node.type.params[i].name);
+          var dst = acc.regs.get_reg(sym);
+          sym.loc = acc.alloci_debt;
+          acc.alloci_debt += alloc_size(node.type.params[i].type);
           asm.push(mips_add(dst.reg, 0, i + 2));
         }
+
         gen_statement(node.body, asm, acc);
         // TODO: should output a return-canary here...
         asm.push('');
@@ -503,11 +507,24 @@ function JCC() {
         break;
       case 'declaration':
         if(node.value !== null) {
-          throw { message: 'todo: declaration initializers' };
+          var dst = find_symbol(acc.scope, node.name).loc;
+          var src = gen_expr(node.value, asm, acc);
+          asm.push(mips_sw(src, MIPSreg.FP, 4*dst));
+          acc.regs.invalidate_all();
         }
         break;
       default:
         throw { message: 'could not gen for: ' + node.node_type };
+    }
+  }
+
+  function gen_lvalue(node, asm, acc) {
+    switch(node.node_type) {
+      case 'identifier':
+        var sym = find_symbol(acc.scope, node.expr);
+        return { reg: MIPSreg.FP, offset: sym.loc };
+      default:
+        throw { message: "invalid lvalue (or not implemented." };
     }
   }
 
@@ -537,13 +554,20 @@ function JCC() {
             acc.regs.invalidate(src1);
           }
         }
-        asm.push(mips_call(node.func.expr)); // TODO you wish!
+        asm.push(mips_call("_" + node.func.expr)); // TODO you wish!
         for(var i = 0; i < Math.min(4, node.args.length); i++) { acc.regs.invalidate(i + 2); }
         if(node.args.length > 4) asm.push(mips_popn(node.args.length - 4));
         if(dst === 0) return;
         if(dst === null) var dst = acc.regs.get_reg('temp', asm).reg;
         if(dst !== 1) asm.push(mips_add(dst,0,1));
         return dst;
+      case "=":
+        var dst = gen_lvalue(node.targets[0], asm, acc);
+        var src = gen_expr(node.targets[1], asm, acc);
+        asm.push(mips_sw(src, dst.reg, 4*dst.offset));
+        acc.regs.invalidate_all();
+        // NOTE: see "declaration" in gen_statement. duplicates this code :(
+        break;
       case '<':
       case '+':
       case '-':
@@ -586,7 +610,7 @@ function JCC() {
           return src1;
         }
         if(dst == null) dst = acc.regs.get_reg(sym, asm);
-        asm.push(mips_lw(dst.reg, MIPSreg.FP, sym.loc));
+        asm.push(mips_lw(dst.reg, MIPSreg.FP, 4*sym.loc));
         return dst.reg;
       default:
         throw { message: 'could not gen for: ' + node.node_type };
@@ -602,7 +626,7 @@ function JCC() {
   function mips_add(dst, src1, src2)  { return 'add $' + dst + ', $' + src1 + ', $' + src2; }
   function mips_addi(dst, src1, src2) { return 'addi $' + dst + ', $' + src1 + ', ' + src2; }
   function mips_sub(dst, src1, src2)  { return 'sub $' + dst + ', $' + src1 + ', $' + src2; }
-  function mips_mult(dst, src1, src2) { return 'mult $' + src1 + ', $' + src2 + 'mflo $' + dst; }
+  function mips_mult(dst, src1, src2) { return 'mult $' + src1 + ', $' + src2 + '\nmflo $' + dst; }
   function mips_slt(dst, src1, src2)  { return 'slt $' + dst + ', $' + src1 + ', $' + src2; }
   function mips_mflo(dst) { return 'mflo $' + dst; }
   function mips_mfhi(dst) { return 'mfhi $' + dst; }
@@ -611,6 +635,7 @@ function JCC() {
   function mips_j(loc) { return 'j ' + loc; }
   function mips_jr(src) { return 'jr $' + src; }
   function mips_lw(dst, src, off) { return 'lw $' + dst + ', ' + off + '($' + src + ')'; }
+  function mips_sw(dst, src, off) { return 'sw $' + dst + ', ' + off + '($' + src + ')'; }
   function mips_allocai(imm) { return 'allocai ' + imm; }
   function mips_call(dst) { return 'call ' + dst; }
   function mips_ret(src)     { return 'ret $' + src; }
@@ -623,29 +648,26 @@ function JCC() {
   res.compile = function(code) {
     if(typeof res.parse_tree !== 'undefined') delete res.parse_tree;
     if(typeof res.asm !== 'undefined') delete res.asm;
-    try {
-      res.parse_tree = c.parse(code);
-    } catch(err) {
-      // TODO
-      console.log(err);
-      return;
+    res.parse_tree = c.parse(code);
+    if(res.parse_tree.node_type === 'expression_shortcut') {
+      throw { message: 'expression in global scope - not good.' };
     }
-
-    try {
-      analyze(res.parse_tree, null);
-    } catch(err) {
-      // TODO
-      console.log(err);
-      return;
-    }
-
-    try {
-      res.asm = gen(res.parse_tree).join('\n');
-    } catch(err) {
-      // TODO
-      console.log(err);
-      return;
-    }
+    analyze(res.parse_tree, null);
+    res.asm = gen(res.parse_tree).join('\n');
   }
+
+  res.repl_compile = function(code) {
+    if(typeof res.asm === 'undefined') throw { message: "fix definitions before using repl." };
+    var repl_pt = c.parse(code);
+    if(repl_pt.node_type !== 'expression_shortcut') {
+      throw { message: 'bad repl input' };
+    }
+    var repl_pt_dummy = c.parse('int foo() { return; }');
+    repl_pt_dummy.globals[0].body.contents[0].target = repl_pt.expr;
+    analyze(repl_pt_dummy, { parent_scope: res.parse_tree });
+    repl_asm = "entry:\ncall repl\nhalt\nrepl:\n" + gen(repl_pt_dummy).slice(1).join('\n');
+    return repl_asm;
+  }
+
   return res;
 }
